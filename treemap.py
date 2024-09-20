@@ -4,6 +4,21 @@ import plotly.express as px
 from collections import defaultdict
 from tqdm import tqdm  # Import tqdm for the progress bar
 
+# Define a tree node to represent files and directories
+class TreeNode:
+    def __init__(self, name, is_dir=True):
+        self.name = name
+        self.is_dir = is_dir
+        self.children = []
+        self.num_lines = 0  # Number of lines for files, 0 for directories
+
+    def add_child(self, child_node):
+        self.children.append(child_node)
+
+    def is_empty(self):
+        # A directory is empty if it contains no files and no non-empty directories
+        return all(child.is_empty() for child in self.children) if self.is_dir else False
+
 # Set up argument parser
 parser = argparse.ArgumentParser(description='Visualize a directory of files as a tree map based on file structure.')
 parser.add_argument('directory', type=str, help='Directory to visualize')
@@ -16,21 +31,29 @@ directory = os.path.abspath(args.directory)  # Convert to absolute path to handl
 extensions = args.extensions if args.extensions else None  # Set extensions to None if no extensions are provided
 exclude_dirs = [os.path.abspath(os.path.join(directory, d)) for d in args.exclude_dirs]  # Convert exclude directories to absolute paths
 
-# Gather the data for the given directory
-def gather_file_data(dir_path):
-    file_data = []
+# Function to build the tree of files and directories
+def build_file_tree(dir_path):
+    root = TreeNode(name=".", is_dir=True)  # Set root directory name to "."
 
     # Calculate total number of files to be processed for the progress bar
     file_count = sum(len(files) for _, _, files in os.walk(dir_path))  # Get the number of files
 
     with tqdm(total=file_count, desc="Processing files") as pbar:  # Create tqdm progress bar
-        for root, dirs, files in os.walk(dir_path):
+        for root_dir, dirs, files in os.walk(dir_path):
             # Skip excluded directories
-            dirs[:] = [d for d in dirs if os.path.abspath(os.path.join(root, d)) not in exclude_dirs]
+            dirs[:] = [d for d in dirs if os.path.abspath(os.path.join(root_dir, d)) not in exclude_dirs]
 
+            # Construct the relative path from the root directory
+            relative_root_dir = os.path.relpath(root_dir, dir_path)
+            if relative_root_dir == ".":
+                relative_root_dir = ""  # Treat root directory as empty
+
+            current_node = get_or_create_node(root, relative_root_dir.split(os.sep))
+
+            # Add files to the current node
             for file in files:
                 pbar.update(1)  # Increment the progress bar
-                filepath = os.path.join(root, file)
+                filepath = os.path.join(root_dir, file)
 
                 # If extensions are provided, check if the file extension matches the provided extensions
                 if extensions and not any(filepath.endswith(ext) for ext in extensions):
@@ -44,71 +67,94 @@ def gather_file_data(dir_path):
                     print(f"Error reading {filepath}: {e}")
                     continue
 
-                # Skip files with zero lines
-                if num_lines == 0:
-                    continue
+                # Add file node to the current directory node
+                file_node = TreeNode(name=file, is_dir=False)
+                file_node.num_lines = num_lines
+                current_node.add_child(file_node)
 
-                # Add file data
-                relative_path = os.path.relpath(filepath, dir_path)
-                dir_structure = relative_path.split(os.sep)
-                file_data.append((dir_structure, num_lines))
+    return root
 
-    return file_data
+# Helper function to get or create a node in the tree based on the path parts
+def get_or_create_node(root, path_parts):
+    current_node = root
+    for part in path_parts:
+        if not part:  # Skip empty part (root directory)
+            continue
+        # Find if part exists as a child
+        matching_child = next((child for child in current_node.children if child.name == part and child.is_dir), None)
+        if not matching_child:
+            matching_child = TreeNode(name=part, is_dir=True)
+            current_node.add_child(matching_child)
+        current_node = matching_child
+    return current_node
 
-# Gather the data for the given directory
-file_data = gather_file_data(directory)
+# Function to prune empty directories from the tree
+def prune_empty_dirs(node):
+    if node.is_dir:
+        # Recursively prune children
+        node.children = [child for child in node.children if not child.is_empty()]
+        for child in node.children:
+            prune_empty_dirs(child)
+
+# Function to collapse directories with only one child directory
+def collapse_single_child_dirs(node):
+    if node.is_dir:
+        while len(node.children) == 1 and node.children[0].is_dir:
+            # Collapse this directory with its only child
+            child = node.children[0]
+            node.name = os.path.join(node.name, child.name)  # Concatenate directory names
+            node.children = child.children  # Inherit the child's children
+
+        # Recursively collapse for all children
+        for child in node.children:
+            collapse_single_child_dirs(child)
+
+# Function to traverse the tree and build the treemap data
+def traverse_tree(node, parent_id, ids, names, parents, values, hover_lines, file_names):
+    current_id = os.path.join(parent_id, node.name).replace('\\', '/')
+
+    ids.append(current_id)
+    names.append(node.name)
+    parents.append(parent_id)
+
+    if node.is_dir:
+        values.append(0)  # Directory gets a value of 0, we'll calculate line count later
+        hover_lines.append(0)  # Directory hover lines start with 0
+        file_names.append(node.name)  # Just the directory name
+        # Traverse children
+        for child in node.children:
+            traverse_tree(child, current_id, ids, names, parents, values, hover_lines, file_names)
+    else:
+        values.append(node.num_lines)
+        hover_lines.append(node.num_lines)
+        file_names.append(node.name)  # Just the file name
+
+# Gather the file tree for the given directory
+file_tree = build_file_tree(directory)
+
+# Prune empty directories from the tree
+prune_empty_dirs(file_tree)
+
+# Collapse directories with only one child
+collapse_single_child_dirs(file_tree)
 
 # Prepare the data for Plotly's treemap
-ids = ['.']  # Start with root node as '.'
-names = ['.']  # Root node name
-parents = ['']  # Root node has no parent
-values = [0]  # Root node starts with 0 lines
-hover_lines = [0]  # Root node hover starts with 0 lines
+ids = []
+names = []
+parents = []
+values = []
+hover_lines = []
+file_names = []  # Store just the file names for hover information
 
-# Dictionary to accumulate line counts for directories
-dir_line_counts = defaultdict(int)
+# Traverse the tree and fill in the treemap data
+traverse_tree(file_tree, '', ids, names, parents, values, hover_lines, file_names)
 
-for f in file_data:
-    path_parts = f[0]  # Directory structure with file name at the end
-    num_lines = f[1]
-    
-    # Build unique IDs and labels
-    for i in range(len(path_parts)):
-        current_path = os.path.join('.', *path_parts[:i+1])  # Unique ID (rooted at '.')
-        parent_path = os.path.join('.', *path_parts[:i]) if i > 0 else '.'  # Parent ID, root points to itself
-
-        # Extract the name to display
-        name = path_parts[i]
-
-        # For files, we always display just the filename
-        display_name = name
-
-        if current_path not in ids:
-            ids.append(current_path)
-            parents.append(parent_path if parent_path else '.')  # Root has no parent
-            names.append(display_name)
-
-            if i == len(path_parts) - 1:  # It's a file
-                values.append(num_lines)
-                hover_lines.append(num_lines)
-            else:
-                # For directories, initialize hover_lines with 0 (we'll calculate total later)
-                values.append(0)
-                hover_lines.append(0)
-
-        # Accumulate the line count for directories
-        if i < len(path_parts) - 1:  # Only for directories, not the file itself
-            dir_path = os.path.join('.', *path_parts[:i+1])
-            dir_line_counts[dir_path] += num_lines
-
-# After processing all files, update hover information for directories
-for i, id in enumerate(ids):
-    if id in dir_line_counts:
-        hover_lines[i] = dir_line_counts[id]
-
-# Accumulate the total lines for the root node
-total_lines = sum(values)
-hover_lines[0] = total_lines  # Update hover for root (index 0)
+# Update hover lines for directories by summing child line counts
+for i, value in enumerate(values):
+    if value == 0:  # Only for directories
+        dir_id = ids[i]
+        total_lines = sum(hover_lines[j] for j in range(len(ids)) if ids[j].startswith(dir_id + '/'))
+        hover_lines[i] = total_lines
 
 # Create the treemap with default coloring
 fig = px.treemap(
@@ -116,12 +162,13 @@ fig = px.treemap(
     names=names,
     parents=parents,
     values=values,
-    custom_data=[hover_lines]  # Pass total lines for hover
+    custom_data=[hover_lines, file_names]  # Pass total lines and file names for hover
 )
 
 # Customize text and hover information
 fig.data[0].textinfo = 'label'
 fig.data[0].hovertemplate = (
+    'Name: %{customdata[1]}<br>'  # Add file or directory name to hover
     'Lines: %{customdata[0]:,}<extra></extra>'  # Add :, to format numbers with commas
 )
 
